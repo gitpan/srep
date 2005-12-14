@@ -1,0 +1,11 @@
+srep performs bulk replacements on the contents of series of files.
+
+It is driven by a data file with replacement instructions.
+
+When processing the files, each file is rewritten when one or more of
+the replacement instructions succeed. If no replacement instructions
+succeed, the file is left unmodified.
+
+All the power of Perl patters can be used in the replacement
+instructions. Additionally, facilities are provided for easy
+replacement of words and balanced bracketed strings.

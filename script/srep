@@ -1,0 +1,713 @@
+#!/usr/bin/perl -w
+my $RCS_Id = '$Id: srep.pl,v 1.9 2005/12/14 15:50:33 jv Exp $ ';
+
+# Author          : Johan Vromans
+# Created         : Thu May 18 15:36:32 2000
+# Last Modified By: Johan Vromans
+# Last Modified On: Wed Dec 14 16:48:22 2005
+# Update Count    : 438
+# Status          : Unknown, Use with caution!
+
+################ Common stuff ################
+
+use 5.6.0;
+use strict;
+
+my $VERSION;
+$VERSION = sprintf("%d.%02d", '$Revision: 1.9 $ ' =~ /\$Revision:\s+(\d+)\.(\d+)/);
+
+# Package name.
+my $my_package = 'Sciurix';
+# Program name and version.
+my ($my_name, $my_version) = $RCS_Id =~ /: (.+).pl,v ([\d.]+)/;
+# Tack '*' if it is not checked in into RCS.
+$my_version .= '*' if length('$Locker:  $ ') > 12;
+
+################ Command line parameters ################
+
+use Getopt::Long 2.13;
+use File::Find;
+use IO::File;
+
+my $recursive = 0;		# recurse directories
+my $verbose = 0;		# verbose processing
+my $data;
+my @filter;
+my @filter_pat;
+my @exclude;
+my @exclude_pat;
+my @aux;
+my $auxidx = 0;
+my $dry_run = 0;		# dry run
+our %VARS;			# user defined variables
+
+# Development options (not shown with -help).
+my $debug = 0;			# debugging
+my $trace = 0;			# trace (show process)
+my $test = 0;			# test (no actual processing)
+
+app_options();
+
+# Options post-processing.
+$trace |= ($debug || $test);
+$verbose |= $trace;
+
+################ Presets ################
+
+################ The Process ################
+
+my $ok = make_patterns();
+die("$my_name: Error in patterns -- aborted\n") unless $ok;
+
+setup_filters();
+
+if ( @ARGV == 0 ) {
+    die("$my_name: Cannot dry-run in filter mode\n") if $dry_run;
+    stream_edit();
+}
+else {
+    foreach my $arg ( @ARGV ) {
+	if ( -d $arg ) {
+	    unless ( $recursive ) {
+		warn("$arg: directory (skipped)\n");
+		next;
+	    }
+	    find(\&wanted, $arg);
+	    next;
+	}
+	unless ( -f _ && -s _ && -T _ ) {
+	    warn("$arg: not a text file (skipped)\n");
+	    next;
+	}
+	edit($arg, $arg, (stat(_))[2]);
+    }
+}
+
+################ Subroutines ################
+
+my $filter_pat;
+my $exclude_pat;
+
+sub wanted {
+    return if $filter_pat && !/$filter_pat/;
+    return if $exclude_pat && /$exclude_pat/;
+    return unless -f && -s _ && -T _;
+    edit($_, $File::Find::name, (stat(_))[2]);
+}
+
+sub edit {
+    my ($name, $fullname, $mode) = (@_);
+    print STDERR ("Trying $fullname...\n") if $verbose;
+    unless ( open(IN, "<$name") ) {
+	warn("Open $name ($fullname): $!\n");
+	return;
+    }
+    local ($/);
+    local ($_);
+    $_ = <IN>;
+    close(IN);
+
+    return unless change();
+    print STDERR ("Changed: $fullname\n") if $verbose;
+    return if $dry_run;
+
+    # Make writable first.
+    chmod($mode|0220, $name);
+    unless ( open(OUT, ">$name") ) {
+	warn("Create $name ($fullname): $!\n");
+	return;
+    }
+    print OUT $_;
+    close(OUT);
+
+    # Restore mode.
+    chmod($mode, $name);
+}
+
+sub stream_edit {
+    local ($/);
+    $_ = <>;
+
+    return unless change();
+    print STDERR ("Changed: -\n") if $verbose;
+
+    print STDOUT $_;
+}
+
+sub make_patterns {
+
+    # Start of the subroutine. $npp and friends are patterns to match
+    # balanced strings w.r.t to parens ($npp), curlies ($ncp) and
+    # square brackets ($nbp). $np and friends are recursive helper
+    # patterns for these.
+    my $code = "";
+    my $need_npp = 0;		# need recursive patterns for ()
+    my $need_nbp = 0;		# need recursive patterns for []
+    my $need_ncp = 0;		# need recursive patterns for {}
+    my $need_nap = 0;		# need recursive patterns for <>
+
+    my $error = 0;
+    my $fh = new IO::File($data);
+    die("$my_name: Error opening data [$!]\n")
+      unless defined $fh;
+
+    while ( <$fh> ) {
+	next if /^#/;
+	next unless /\S/;
+	chomp;
+
+	if ( /^!filter\s+/ ) {
+	    push(@filter, $');
+	    next;
+	}
+	if ( /^!filter_pat\s+/ ) {
+	    push(@filter_pat, $');
+	    next;
+	}
+	if ( /^!exclude\s+/ ) {
+	    push(@exclude, $');
+	    next;
+	}
+	if ( /^!exclude_pat\s+/ ) {
+	    push(@exclude_pat, $');
+	    next;
+	}
+
+	my ($type, $src, $dst) = split(' ', $_, 3);
+	$dst = "" unless defined $dst;
+
+	my $t = lc($type);
+	my $cond = 0;
+	$cond = $1 if $t =~ s/^([!?])//;
+
+	if ( $t eq 's' || $t eq 'w' ) {
+	    $src = quotemeta($src);
+	    $src = '(?:^|\b)'.$src.'(?:$|\b)' if $t eq 'w';
+	    $code .= "    \$did += s\000$src\000$dst\000mg".
+	      ($type eq $t ? "i" : "").
+		($cond eq '?' ? " if \$did" :
+		 $cond eq '!' ? " unless \$did" : "").
+		  ";\n";
+	}
+	elsif ( $t eq 'p' || $t eq 'e' || $t eq 'ee' ) {
+	    $need_npp += $src =~ s/\\\(\(\.\.\.\)\\?\)/\\\(((?:\$npp)+)\\)/g;
+	    $need_ncp += $src =~ s/\\\{\(\.\.\.\)\}/\\\{((?:\$ncp)+)\\}/g;
+	    $need_nbp += $src =~ s/\\\[\(\.\.\.\)\]/\\\[((?:\$nbp)+)\\]/g;
+	    $need_nap += $src =~ s/\\\<\(\.\.\.\)\>/\\\<((?:\$nap)+)\\>/g;
+	    $need_npp += $src =~ s/\\\(\.\.\.\)/\\\((?:\$npp)+\\)/g;
+	    $need_ncp += $src =~ s/\\\{\.\.\.\}/\\\{(?:\$ncp)+\\}/g;
+	    $need_nbp += $src =~ s/\\\[\.\.\.\]/\\\[(?:\$nbp)+\\]/g;
+	    $need_nap += $src =~ s/\\\<\.\.\.\>/\\\<(?:\$nap)+\\>/g;
+	    $code .= "    \$did += s\000$src\000$dst\000mg".
+	      ($type eq $t ? "i" : "").
+		($t ne 'p' ? $t : "").
+		  ($cond eq '?' ? " if \$did" :
+		   $cond eq '!' ? " unless \$did" : "").
+		    ";\n";
+	}
+	elsif ( $t eq '<<' || $t eq '>>' ) {	# prepend/append
+
+	    if ( lc($src) eq 'file' ) {
+		my $fh = do { local *F; *F };
+		open($fh, $dst) or die("$my_name: $dst: $!\n");
+		local $/;
+		$aux[$auxidx] = <$fh>;
+		close($fh);
+	    }
+	    else {
+		$aux[$auxidx] = $src;
+	    }
+	    print STDERR ("aux[$auxidx]: ",
+			  $t eq '<<' ? "prepend " : "append  ",
+			  length($aux[$auxidx]),
+			  " bytes",
+			  $dst ? " from file $dst " : "",
+			  ($cond eq '?' ? " if changed" :
+			   $cond eq '!' ? " if not changed" : ""),
+			  "\n") if $trace;
+	    my $data = $dst ? "\$aux[$auxidx]" :
+	      "qq\000$aux[$auxidx]\000";
+	    $code .= "    \$_ " .
+	      ($t eq '<<' ? "= $data . \$_" : ".= $data" ).
+	      ($cond eq '?' ? " if \$did" :
+	       $cond eq '!' ? " unless \$did++" : "; \$did++") . ";\n";
+	    $auxidx++;
+	    next;
+	}
+	elsif ( $t eq 'x' ) {
+	    $src = "\$did" if $src eq "";
+	    $code .= "    return $src".
+	      ($cond eq '?' ? " if \$did" :
+	       $cond eq '!' ? " unless \$did" : "").
+		 ";\n";
+	    next;
+	}
+	else {
+	    warn("Unknown entry in patterns file [line $.]\n");
+	    warn("\t$_\n");
+	    $error++;
+	    next;
+	}
+
+	# Verify.
+	if ( $src =~ /\000/ ) {
+	    $@ = "Pattern contains NUL characters\n";
+	}
+	elsif ( $dst =~ /\000/ ) {
+	    $@ = "Replacement contains NUL characters\n";
+	}
+	else {
+	    eval { qr/$src/ };
+	}
+	if ( $@ ) {
+	    $@ =~ s/ at .*//;
+	    warn("Error in pattern [line $.] $@");
+	    $error++;
+	}
+    }
+
+    die("$my_name: No valid replacement instructions found in $data\n")
+      unless $code;
+
+    my $sub = "sub change {\n    my \$did = 0;\n\n";
+    if ( $need_npp ) {
+	$sub .= <<'EOD';
+    our $np = qr/\((?:(?>[^\(\)]+)|(??{$np}))*\)/;
+    my $npp = qr/[^\(\)]*(?:$np)?[^\(\)]*/;
+EOD
+    }
+    if ( $need_ncp ) {
+	$sub .= <<'EOD';
+    our $nc = qr/\{(?:(?>[^\{\}]+)|(??{$nc}))*\}/;
+    my $ncp = qr/[^\{\}]*(?:$nc)?[^\{\}]*/;
+EOD
+    }
+    if ( $need_nbp ) {
+	$sub .= <<'EOD';
+    our $nb = qr/\[(?:(?>[^\[\]]+)|(??{$nb}))*\]/;
+    my $nbp = qr/[^\[\]]*(?:$nb)?[^\[\]]*/;
+EOD
+    }
+    if ( $need_nap ) {
+	$sub .= <<'EOD';
+    our $na = qr/\<(?:(?>[^\<\>]+)|(??{$na}))*\>/;
+    my $nap = qr/[^\<\>]*(?:$na)?[^\<\>]*/;
+EOD
+    }
+    $sub .= $code . "\n    \$did;\n}";
+    if ( $debug ) {
+	my $p = $sub;
+	$p =~ s/\000/#/g;
+	print STDERR ($p, "\n");
+    }
+    return 0 if $error;
+    eval($sub);
+    die("$my_name: Error in patterns: $@") if $@;
+    1;
+}
+
+sub glob_to_pat {
+    my ($pat) = @_;
+    my @a = split(/(\[[^\]]+\]|[*.?])/, $pat);
+    return
+      join('',
+	   '(\A|/)',
+	   (map { ($_ eq '*' ? '.*' :
+		   ($_ eq '?' ? '.' :
+		    ($_ eq '.' ? '\.' :
+		     ($_ =~ /^\[/ ? $_ : quotemeta($_)))))
+	      } @a),
+	   '\Z');
+}
+
+sub pats_to_pat {
+    my ($pats) = @_;
+    my $pat = '';
+    my $re;
+    foreach $re ( @$pats ) {
+	eval { '' =~ /$re/ };
+	if ( $@ ) {
+	    $@ =~ s/ at .* line.*$//;
+	    die("$my_name: Invalid pat: $re $@");
+	}
+	$pat .= "($re)|";
+    }
+    chop($pat);
+    '('.$pat.')';
+}
+
+sub setup_filters {
+    # Add --filter wildcards to --filter-pat list.
+    foreach my $pat ( @filter ) {
+	push(@filter_pat, glob_to_pat($pat));
+    }
+
+    # Build regex from --filter-regex list.
+    if ( @filter_pat ) {
+	$filter_pat = pats_to_pat(\@filter_pat);
+	warn("filter pattern: $filter_pat\n") if $debug;
+    }
+
+    # Add --exclude wildcards to --exclude-pat list.
+    foreach my $pat ( @exclude ) {
+	push(@exclude_pat, glob_to_pat($pat));
+    }
+
+    # Build regex from --exclude-regex list.
+    if ( @exclude_pat ) {
+	$exclude_pat = pats_to_pat(\@exclude_pat);
+	warn("exclude pattern: $exclude_pat\n") if $debug;
+    }
+}
+
+################ Option Processing ################
+
+sub app_options {
+    my $help = 0;		# handled locally
+    my $ident = 0;		# handled locally
+
+    Getopt::Long::Configure qw(no_ignore_case bundling);
+    if ( !GetOptions(
+		     'recursive' => \$recursive,
+		     'data=s'	=> \$data,
+		     'filter=s'		=> \@filter,
+		     'exclude=s'	=> \@exclude,
+		     'filter_pat=s'	=> \@filter_pat,
+		     'exclude_pat=s'	=> \@exclude_pat,
+		     'define|D=s%'	=> \%VARS,
+		     'dry-run|n'	=> \$dry_run,
+		     'verbose'	=> \$verbose,
+		     'ident'	=> \$ident,
+		     'trace'	=> \$trace,
+		     'help|?'	=> \$help,
+		     'debug'	=> \$debug,
+		    ) or $help )
+    {
+	app_usage(2);
+    }
+    print STDERR ("This is $my_name version $my_version\n") if $ident;
+    die("$my_name: Use --data to provide instructions!\n") unless $data;
+}
+
+sub app_usage {
+    my ($exit) = @_;
+    print STDERR <<EndOfUsage;
+Apply substitution patterns to series of files.
+
+Usage: $0 --data=... [options] [files and directories ...]
+    -recursive		recurse directories
+    -data XXX		file with instructions. This option must appear!
+    -Dxxx=yyy		define variable xxx to be yyy
+    --define=xxx=yyy	same
+    -filter GLOB	filter these files only (may occur multple times)
+    -filter_pat PAT	filter these files only (may occur multple times)
+    -exclude GLOB	exclude these files (may occur multple times)
+    -exclude_pat PAT	exclude these files (may occur multple times)
+    -dry-run		don't actually change!
+    -help		this message
+    -ident		show identification
+    -verbose		verbose information
+EndOfUsage
+    exit $exit if $exit != 0;
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+srep -- Perform bulk replacements on files
+
+=head1 SUMMARY
+
+    srep --data=... [ options ] [ files|directories ... ]
+
+=head1 DESCRIPTION
+
+B<srep> performs bulk replacements on the contents of series of files.
+
+It is driven by a data file with replacement instructions.
+
+When processing the files, each file is rewritten when one or more of
+the replacement instructions succeed. If no replacement instructions
+succeed, the file is left unmodified.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--recursive>
+
+Recurses through directories. Without this option, directories are
+ignored.
+
+=item B<--data>=I<XXX>
+
+Specifies the file with replacement instructions.
+This is a mandatory option.
+
+=item B<-D>I<xxx>=I<yyy>
+
+Defines variable I<xxx> to have the value I<yyy>. See the description
+of replacement files how to use these variables.
+
+=item B<--define>=I<xxx>=I<yyy>
+
+Same as  B<-D>I<xxx>=I<yyy>.
+
+=item B<--filter>=I<glob>
+
+Processes only files with names that obey the shell pattern I<glob>.
+This option may occur more than once, the patterns will be combined.
+
+=item B<--filter_pat>=I<pat>
+
+Processes only files with names that obey the Perl pattern I<pat>.
+This option may occur more than once, the patterns will be combined.
+
+=item B<--exclude>=I<glob>
+
+Excludes files with names that obey the shell pattern I<glob>.
+This option may occur more than once, the patterns will be combined.
+
+=item B<--exclude_pat>=I<pat>
+
+Excludes files with names that obey the Perl pattern I<glob>.
+This option may occur more than once, the patterns will be combined.
+
+=item B<--dry-run>
+
+Runs, but do not change any files. This is useful to test the
+instructions in the replacement file.
+
+=item B<--help>
+
+Provides a help message. Does not execute anything.
+
+=item B<--ident>
+
+Shows identification and version of the program.
+
+=item B<--verbose>
+
+Produces verbose information.
+
+=item B<--debug>
+
+Produces debugging information.
+
+=back
+
+=head1 REPLACEMENT FILES
+
+The replacement file specifies what changes are to be made to the
+files.
+
+The replacement file is interpreted on a line by line basis. Empty
+lines, and lines that start with a C<#>, are ignored.
+
+Generally, each line contains an operation in the form
+
+    operation  argument  replacement
+
+The words are whitespace separated, which implies that I<argument>
+cannot contain whitespace. I<replacement> can contain whitespace.
+I<replacement> may be omitted, in which case it defaults to the empty
+string.
+
+In I<replacement> all Perl escapes (e.g., C<\n>), and pattern match
+variables (e.g., C<$1>, C<$&>) can be used.
+
+These are the basic operations:
+
+=over 4
+
+=item B<p> I<pattern> I<replacement>
+
+The Perl pattern I<pattern> is replaced by I<replacement>.
+The operation is case-insensitive.
+
+Example:
+
+    p creat[\040\t]?( create(
+
+Note the use of C<\040> to indicate a literal space.
+
+=item B<P> I<pattern> I<replacement>
+
+Identical to B<p>, but case-sensitive.
+
+=item B<s> I<string> I<replacement>
+
+Replaces each substring I<string> by I<replacement>.
+The operation is case-insensitive.
+
+=item B<S> I<string> I<replacement>
+
+Identical to B<s>, but case-sensitive.
+
+=item B<w> I<word> I<replacement>
+
+Replaces each occurrence of the word (according to Perl's defintion
+of words) by I<replacement>.
+The operation is case-insensitive.
+
+Note: Perl considers as words anything bounded by C<\w\W> and C<\W\w>
+transitions.
+
+=item B<W> I<word> I<replacement>
+
+Identical to B<w>, but case-sensitive.
+
+=item B<e> I<pattern> I<replacement>
+
+Like B<p>, but allows Perl expressions in the I<replacement> text.
+
+Variables that have been defined on the command line (with
+B<--define>=I<xxx>=I<yyy>) are stored in a special hash named C<%VARS>
+and can be referenced in the replacement text with $VARS{I<xxx>}.
+
+=item B<ee> I<pattern> I<replacement>
+
+Like B<e>, but evaluates I<replacement> twice for increased power.
+
+=item B<E> I<pattern> I<replacement>
+
+Identical to B<e>, but case-sensitive.
+
+=item B<EE> I<pattern> I<replacement>
+
+Identical to B<ee>, but case-sensitive.
+
+=item B<x> I<value>
+
+Terminates any further replacements on the current file.
+If I<value> is zero, the file is considered to be unmodified and will
+not be rewritten.
+
+This is most useful with an operator condition, see below.
+
+=item B<E<lt>E<lt>> I<text>
+
+Prepends the I<text> to the file data.
+
+=item B<E<gt>E<gt>> I<text>
+
+Appends the I<text> to the file data.
+
+=item B<E<lt>E<lt>> B<file> I<name>
+
+Prepends the contents of the named file.
+
+=item B<E<gt>E<gt>> B<file> I<name>
+
+Appends the contents of the named file.
+
+=back
+
+=head2 Operator conditions
+
+All of the operators described in the previous section may be preceded
+with C<?> or C<!> to have this operation applied conditionally.
+
+With C<?>, the operation is only applied if any modifications have
+been made to the current file so far.
+
+With C<!>, the operation is only applied unless modifications have
+been made to the current file so far.
+
+For example:
+
+    s  foo  bar
+    !x
+    ...other operations...
+
+This will apply the C<...other operations...> only if the first
+substitution succeeded.
+
+=head2 Matching balanced strings
+
+Special pattern elements are available to deal with balanced brackets.
+Recognized brackets are parentheses C<()>, braces C<{}>, straight
+brackets C<[]> and angular (broken) brackets C<< <> >>. In the
+description below, braces are used but the description applies to all
+recognized brackets.
+
+=over 4
+
+=item B<\{...\}>
+
+This matches a bracketed string that is itself balanced with
+respect to these brackets.
+
+Note that C<...> indicates three literal dots in a row.
+
+=item B<\{(...)}>
+
+Like B<\{...\}>, except that the matched string is assigned to the
+corresponding $I<n> variable I<without the outer brackets>. For
+example, C<\{(...)\}> will match C<{x{xx}}> but assign C<x{xx}> to
+C<$1>.
+
+Note that C<...> indicates three literal dots in a row.
+
+=back
+
+=head2 Special instructions
+
+The following special instructions may be contained in the replacement
+control file. All special instructions double the functionality of
+some of the command line options.
+
+=over 4
+
+=item B<!filter> I<glob>
+
+Same as command line argument B<--filter>=I<glob>.
+
+=item B<!filter_pat> I<pat>
+
+Same as command line argument B<--filter_pat>=I<pat>.
+
+=item B<!exclude> I<glob>
+
+Same as command line argument B<--exclude>=I<glob>.
+
+=item B<!exclude_pat> I<pat>
+
+Same as command line argument B<--exclude_pat>=I<pat>.
+
+=back
+
+The choice of the leading exclamation mark is unfortunate.
+
+=head1 BUGS
+
+Doesn't currently make backups of the files.
+
+The contents of each of the files must fit in memory, together with
+the contents of any append/prepend files.
+
+Literal NUL characters are not allowed in patterns and replacement
+texts. Use C<\0> (backslash-zero) instead.
+
+=head1 AUTHOR
+
+Johan Vromans <jvromans@squirrel.nl>
+
+=head1 COPYRIGHT AND DISCLAIMER
+
+This program is Copyright 2000,2005,2006 by Squirrel Consultancy. All
+rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of either: a) the GNU General Public License as
+published by the Free Software Foundation; either version 1, or (at
+your option) any later version, or b) the "Artistic License" which
+comes with Perl.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See either the
+GNU General Public License or the Artistic License for more details.
